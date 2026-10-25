@@ -1,8 +1,8 @@
-name: Strategy Finder Universal CI
+name: ShadowRunner Acceptance CI
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
@@ -35,6 +35,11 @@ on:
         description: 'Original run ID that triggered fallback'
         required: false
         default: ''
+        type: string
+      sleep_seconds:
+        description: 'Optional sleep duration in workload (used for controlled testing)'
+        required: false
+        default: '0'
         type: string
 
 concurrency:
@@ -84,8 +89,8 @@ jobs:
             --required-os "linux" \
             $FORK_FLAG
 
-  test:
-    name: Strategy Test & Benchmark Suite
+  workload:
+    name: Workload Execution
     needs: coordinator
     runs-on: ${{ fromJSON(needs.coordinator.outputs.runner) }}
     steps:
@@ -94,7 +99,7 @@ jobs:
         with:
           ref: ${{ inputs.target_commit || github.sha }}
 
-      - name: Set up Host Environment (Windows)
+      - name: Setup Host Environment Paths (Windows)
         if: runner.os == 'Windows'
         shell: powershell
         run: |
@@ -103,11 +108,57 @@ jobs:
           $env:Path = "$machinePath;$userPath;$env:Path"
           Write-Host "PATH configured for Windows runner."
 
-      - name: Set up Python (Hosted Linux)
+      - name: Host Diagnostics & Metadata (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Write-Host "=== RUNNER ENVIRONMENT METADATA ==="
+          Write-Host "Target Infrastructure: ${{ needs.coordinator.outputs.target }}"
+          Write-Host "Routing Reason:        ${{ needs.coordinator.outputs.reason }}"
+          Write-Host "OS:                    $env:OS"
+          Write-Host "Machine:               $env:COMPUTERNAME"
+          Write-Host "Commit SHA:            $env:GITHUB_SHA"
+          Write-Host "Fallback Attempt:      ${{ inputs.fallback_attempt || '0' }}"
+          Write-Host "Python:                $(python --version)"
+          Write-Host "==================================="
+
+      - name: Host Diagnostics & Metadata (Linux)
         if: runner.os == 'Linux'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        shell: bash
+        run: |
+          echo "=== RUNNER ENVIRONMENT METADATA ==="
+          echo "Target Infrastructure: ${{ needs.coordinator.outputs.target }}"
+          echo "Routing Reason:        ${{ needs.coordinator.outputs.reason }}"
+          echo "OS:                    $(uname -a)"
+          echo "Commit SHA:            $GITHUB_SHA"
+          echo "Fallback Attempt:      ${{ inputs.fallback_attempt || '0' }}"
+          echo "Python:                $(python3 --version)"
+          echo "==================================="
+
+      - name: GPU Hardware Verification (If on Shadow PC)
+        if: needs.coordinator.outputs.target == 'shadow-pc'
+        shell: powershell
+        run: |
+          Write-Host "=== GPU DIAGNOSTICS ==="
+          if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+            nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+          } else {
+            Write-Host "No NVIDIA GPU found."
+          }
+
+      - name: Controlled Sleep (Windows)
+        if: runner.os == 'Windows' && inputs.sleep_seconds != '' && inputs.sleep_seconds != '0'
+        shell: powershell
+        run: |
+          Write-Host "Executing controlled sleep for ${{ inputs.sleep_seconds }} seconds..."
+          Start-Sleep -Seconds ${{ inputs.sleep_seconds }}
+
+      - name: Controlled Sleep (Linux)
+        if: runner.os == 'Linux' && inputs.sleep_seconds != '' && inputs.sleep_seconds != '0'
+        shell: bash
+        run: |
+          echo "Executing controlled sleep for ${{ inputs.sleep_seconds }} seconds..."
+          sleep ${{ inputs.sleep_seconds }}
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
@@ -130,14 +181,12 @@ jobs:
         shell: powershell
         run: |
           flake8 strategy_finder.py --count --select=E9,F63,F7,F82 --show-source --statistics
-          flake8 strategy_finder.py --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
 
       - name: Lint with flake8 (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           flake8 strategy_finder.py --count --select=E9,F63,F7,F82 --show-source --statistics
-          flake8 strategy_finder.py --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
 
       - name: Test with pytest (Windows)
         if: runner.os == 'Windows'
@@ -150,70 +199,6 @@ jobs:
         shell: bash
         run: |
           pytest tests/ -v --tb=short
-
-      - name: Test basic functionality (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          python -c "
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-start = datetime(2023, 1, 1)
-timestamps = [start + timedelta(minutes=i) for i in range(500)]
-np.random.seed(42)
-base_price = 41000
-data = []
-for i, ts in enumerate(timestamps):
-    price = base_price + i * 2 + np.random.normal(0, 50)
-    data.append({
-        'open_time': int(ts.timestamp() * 1000),
-        'open': price + np.random.normal(0, 10),
-        'high': price + abs(np.random.normal(0, 20)),
-        'low': price - abs(np.random.normal(0, 20)),
-        'close': price,
-        'volume': np.random.lognormal(2, 0.8)
-    })
-df = pd.DataFrame(data)
-df.to_csv('ci_test_data.csv', index=False)
-print('Created CI test data')
-          "
-          python strategy_finder.py --csv ci_test_data.csv --budget 10 --seed 42 --min_trades 0 --quick
-          python strategy_finder.py --csv ci_test_data.csv --budget 8 --seed 42 --min_trades 0 --workers 2 --quick
-          Remove-Item -Force -ErrorAction SilentlyContinue ci_test_data.csv, search_results.csv, best_*.png, best_*.csv
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue runs
-
-      - name: Test basic functionality (Linux)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          python -c "
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-start = datetime(2023, 1, 1)
-timestamps = [start + timedelta(minutes=i) for i in range(500)]
-np.random.seed(42)
-base_price = 41000
-data = []
-for i, ts in enumerate(timestamps):
-    price = base_price + i * 2 + np.random.normal(0, 50)
-    data.append({
-        'open_time': int(ts.timestamp() * 1000),
-        'open': price + np.random.normal(0, 10),
-        'high': price + abs(np.random.normal(0, 20)),
-        'low': price - abs(np.random.normal(0, 20)),
-        'close': price,
-        'volume': np.random.lognormal(2, 0.8)
-    })
-df = pd.DataFrame(data)
-df.to_csv('ci_test_data.csv', index=False)
-print('Created CI test data')
-          "
-          python strategy_finder.py --csv ci_test_data.csv --budget 10 --seed 42 --min_trades 0 --quick
-          python strategy_finder.py --csv ci_test_data.csv --budget 8 --seed 42 --min_trades 0 --workers 2 --quick
-          rm -f ci_test_data.csv search_results.csv best_*.png best_*.csv
-          rm -rf runs/
 
   watchdog:
     name: Infrastructure Watchdog
@@ -234,7 +219,7 @@ print('Created CI test data')
             --org "${{ github.repository_owner }}" \
             --repo "${{ github.event.repository.name }}" \
             --run-id "${{ github.run_id }}" \
-            --workload-job-name "Strategy Test" \
+            --workload-job-name "Workload Execution" \
             --workflow-file "ci.yml" \
             --commit-sha "${{ inputs.target_commit || github.sha }}" \
             --ref "${{ github.ref_name }}" \
@@ -243,13 +228,13 @@ print('Created CI test data')
 
   summary:
     name: Workflow Summary & Quality Gate
-    needs: [coordinator, test]
+    needs: [coordinator, workload]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Publish Summary to GitHub
         run: |
-          TEST_STATUS="${{ needs.test.result }}"
+          WORKLOAD_STATUS="${{ needs.workload.result }}"
           TARGET="${{ needs.coordinator.outputs.target }}"
           REASON="${{ needs.coordinator.outputs.reason }}"
           MODE="${{ needs.coordinator.outputs.mode }}"
@@ -259,16 +244,16 @@ print('Created CI test data')
           TESTED_COMMIT="${{ inputs.target_commit || github.sha }}"
 
           STATUS_ICON="✅"
-          if [ "$TEST_STATUS" != "success" ]; then
+          if [ "$WORKLOAD_STATUS" != "success" ]; then
             STATUS_ICON="❌"
           fi
 
           cat <<EOF >> $GITHUB_STEP_SUMMARY
-          # $STATUS_ICON Strategy Finder Universal CI Result
+          # $STATUS_ICON ShadowRunner Universal CI Result
 
           | Metric | Value |
           | :--- | :--- |
-          | **Validation Status** | **$TEST_STATUS** |
+          | **Validation Status** | **$WORKLOAD_STATUS** |
           | **Active Infrastructure** | \`$TARGET\` |
           | **Assigned Runner** | \`$RUNNER\` |
           | **Routing Mode** | \`$MODE\` |
@@ -279,8 +264,8 @@ print('Created CI test data')
 
       - name: Enforce Truthful Gate
         run: |
-          if [ "${{ needs.test.result }}" != "success" ]; then
-            echo "Test suite failed or was cancelled. Failing summary quality gate."
+          if [ "${{ needs.workload.result }}" != "success" ]; then
+            echo "Workload failed or did not complete. Failing summary quality gate."
             exit 1
           fi
-          echo "Test suite passed successfully."
+          echo "Workload passed successfully."

@@ -1,58 +1,168 @@
-name: Strategy Finder CI
+name: Strategy Finder Universal CI
 
 on:
   push:
     branches: [ main, develop ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Runner routing mode (auto, shadow, github)'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - shadow
+          - github
+      wait_timeout:
+        description: 'Max seconds to wait if Shadow runner is busy'
+        required: false
+        default: '300'
+        type: string
+      target_commit:
+        description: 'Specific commit SHA to test (used by fallback)'
+        required: false
+        default: ''
+        type: string
+      fallback_attempt:
+        description: 'Fallback attempt (0 = normal, 1 = fallback)'
+        required: false
+        default: '0'
+        type: string
+      original_run_id:
+        description: 'Original run ID that triggered fallback'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.fallback_attempt || '0' }}
+  cancel-in-progress: false
 
 jobs:
-  test:
+  coordinator:
+    name: Route Runner Target
     runs-on: ubuntu-latest
-    
-    strategy:
-      matrix:
-        python-version: [3.9, 3.10, 3.11]
-    
+    outputs:
+      target: ${{ steps.route.outputs.target }}
+      runner: ${{ steps.route.outputs.runner }}
+      reason: ${{ steps.route.outputs.reason }}
+      mode: ${{ steps.route.outputs.mode }}
+      waited_seconds: ${{ steps.route.outputs.waited_seconds }}
     steps:
-    - uses: actions/checkout@v3
-    
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
-      with:
-        python-version: ${{ matrix.python-version }}
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    
-    - name: Lint with flake8 (basic style check)
-      run: |
-        pip install flake8
-        # Stop the build if there are Python syntax errors or undefined names
-        flake8 strategy_finder.py --count --select=E9,F63,F7,F82 --show-source --statistics
-        # Exit-zero treats all errors as warnings. Line length set to 120 chars
-        flake8 strategy_finder.py --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
-    
-    - name: Test with pytest
-      run: |
-        pytest tests/ -v --tb=short
-    
-    - name: Test basic functionality
-      run: |
-        # Create minimal test data
-        python -c "
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_commit || github.sha }}
+
+      - name: Execute Intelligent Router
+        id: route
+        env:
+          ROUTER_PAT: ${{ secrets.SHADOW_RUNNER_ROUTER_PAT }}
+        run: |
+          IS_FORK="false"
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+            IS_FORK="true"
+          fi
+          
+          MODE="${{ inputs.mode || 'auto' }}"
+          if [ "${{ inputs.fallback_attempt }}" = "1" ]; then
+            MODE="github"
+          fi
+
+          FORK_FLAG=""
+          if [ "$IS_FORK" = "true" ]; then
+            FORK_FLAG="--is-fork"
+          fi
+
+          python3 .github/scripts/ci_fallback_router.py \
+            --mode "$MODE" \
+            --org "${{ github.repository_owner }}" \
+            --wait-timeout "${{ inputs.wait_timeout || '300' }}" \
+            --required-os "linux" \
+            $FORK_FLAG
+
+  test:
+    name: Strategy Test & Benchmark Suite
+    needs: coordinator
+    runs-on: ${{ fromJSON(needs.coordinator.outputs.runner) }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_commit || github.sha }}
+
+      - name: Set up Host Environment (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $machinePath = [System.Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::Machine)
+          $userPath = [System.Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::User)
+          $env:Path = "$machinePath;$userPath;$env:Path"
+          Write-Host "PATH configured for Windows runner."
+
+      - name: Set up Python (Hosted Linux)
+        if: runner.os == 'Linux'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 pytest
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 pytest
+
+      - name: Lint with flake8 (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          flake8 strategy_finder.py --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 strategy_finder.py --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
+
+      - name: Lint with flake8 (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          flake8 strategy_finder.py --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 strategy_finder.py --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
+
+      - name: Test with pytest (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          pytest tests/ -v --tb=short
+
+      - name: Test with pytest (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          pytest tests/ -v --tb=short
+
+      - name: Test basic functionality (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          python -c "
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-
-# Create 500 bars of test data
 start = datetime(2023, 1, 1)
 timestamps = [start + timedelta(minutes=i) for i in range(500)]
 np.random.seed(42)
 base_price = 41000
-
 data = []
 for i, ts in enumerate(timestamps):
     price = base_price + i * 2 + np.random.normal(0, 50)
@@ -64,45 +174,113 @@ for i, ts in enumerate(timestamps):
         'close': price,
         'volume': np.random.lognormal(2, 0.8)
     })
-
 df = pd.DataFrame(data)
 df.to_csv('ci_test_data.csv', index=False)
 print('Created CI test data')
-        "
-        
-        # Test basic functionality
-        python strategy_finder.py --csv ci_test_data.csv --budget 10 --seed 42 --min_trades 0 --quick
-        
-        # Test parallel processing
-        python strategy_finder.py --csv ci_test_data.csv --budget 8 --seed 42 --min_trades 0 --workers 2 --quick
-        
-        # Cleanup
-        rm -f ci_test_data.csv search_results.csv best_*.png best_*.csv
-        rm -rf runs/
+          "
+          python strategy_finder.py --csv ci_test_data.csv --budget 10 --seed 42 --min_trades 0 --quick
+          python strategy_finder.py --csv ci_test_data.csv --budget 8 --seed 42 --min_trades 0 --workers 2 --quick
+          Remove-Item -Force -ErrorAction SilentlyContinue ci_test_data.csv, search_results.csv, best_*.png, best_*.csv
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue runs
 
-  integration-test:
+      - name: Test basic functionality (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          python -c "
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+start = datetime(2023, 1, 1)
+timestamps = [start + timedelta(minutes=i) for i in range(500)]
+np.random.seed(42)
+base_price = 41000
+data = []
+for i, ts in enumerate(timestamps):
+    price = base_price + i * 2 + np.random.normal(0, 50)
+    data.append({
+        'open_time': int(ts.timestamp() * 1000),
+        'open': price + np.random.normal(0, 10),
+        'high': price + abs(np.random.normal(0, 20)),
+        'low': price - abs(np.random.normal(0, 20)),
+        'close': price,
+        'volume': np.random.lognormal(2, 0.8)
+    })
+df = pd.DataFrame(data)
+df.to_csv('ci_test_data.csv', index=False)
+print('Created CI test data')
+          "
+          python strategy_finder.py --csv ci_test_data.csv --budget 10 --seed 42 --min_trades 0 --quick
+          python strategy_finder.py --csv ci_test_data.csv --budget 8 --seed 42 --min_trades 0 --workers 2 --quick
+          rm -f ci_test_data.csv search_results.csv best_*.png best_*.csv
+          rm -rf runs/
+
+  watchdog:
+    name: Infrastructure Watchdog
+    needs: coordinator
+    if: needs.coordinator.outputs.target == 'shadow-pc' && (inputs.fallback_attempt == '0' || inputs.fallback_attempt == '')
     runs-on: ubuntu-latest
-    needs: test
-    
     steps:
-    - uses: actions/checkout@v3
-    
-    - name: Set up Python 3.11
-      uses: actions/setup-python@v3
-      with:
-        python-version: 3.11
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-    
-    - name: Run integration tests
-      run: |
-        python test_phase1_integration.py
-        python test_phase2_integration.py
-    
-    - name: Cleanup artifacts
-      run: |
-        rm -rf runs/
-        rm -f *.csv *.png *.json phase1_test.csv
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_commit || github.sha }}
+
+      - name: Run Active Watchdog Monitor
+        env:
+          ROUTER_PAT: ${{ secrets.SHADOW_RUNNER_ROUTER_PAT }}
+        run: |
+          python3 .github/scripts/ci_watchdog.py \
+            --org "${{ github.repository_owner }}" \
+            --repo "${{ github.event.repository.name }}" \
+            --run-id "${{ github.run_id }}" \
+            --workload-job-name "Strategy Test" \
+            --workflow-file "ci.yml" \
+            --commit-sha "${{ inputs.target_commit || github.sha }}" \
+            --ref "${{ github.ref_name }}" \
+            --pickup-timeout 180 \
+            --poll-interval 15
+
+  summary:
+    name: Workflow Summary & Quality Gate
+    needs: [coordinator, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish Summary to GitHub
+        run: |
+          TEST_STATUS="${{ needs.test.result }}"
+          TARGET="${{ needs.coordinator.outputs.target }}"
+          REASON="${{ needs.coordinator.outputs.reason }}"
+          MODE="${{ needs.coordinator.outputs.mode }}"
+          RUNNER="${{ needs.coordinator.outputs.runner }}"
+          ATTEMPT="${{ inputs.fallback_attempt || '0' }}"
+          ORIGINAL_RUN="${{ inputs.original_run_id || 'N/A' }}"
+          TESTED_COMMIT="${{ inputs.target_commit || github.sha }}"
+
+          STATUS_ICON="✅"
+          if [ "$TEST_STATUS" != "success" ]; then
+            STATUS_ICON="❌"
+          fi
+
+          cat <<EOF >> $GITHUB_STEP_SUMMARY
+          # $STATUS_ICON Strategy Finder Universal CI Result
+
+          | Metric | Value |
+          | :--- | :--- |
+          | **Validation Status** | **$TEST_STATUS** |
+          | **Active Infrastructure** | \`$TARGET\` |
+          | **Assigned Runner** | \`$RUNNER\` |
+          | **Routing Mode** | \`$MODE\` |
+          | **Routing Reason** | $REASON |
+          | **Fallback Attempt** | \`$ATTEMPT\` (Original: \`$ORIGINAL_RUN\`) |
+          | **Tested Commit** | \`$TESTED_COMMIT\` |
+          EOF
+
+      - name: Enforce Truthful Gate
+        run: |
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            echo "Test suite failed or was cancelled. Failing summary quality gate."
+            exit 1
+          fi
+          echo "Test suite passed successfully."
